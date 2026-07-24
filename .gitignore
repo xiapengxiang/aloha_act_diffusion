@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Editors and OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Training outputs and checkpoints
+checkpoint/
+checkpoints/
+ckpt/
+ckpts/
+act-plus-plus/checkpoint/
+act-plus-plus/ckpt/
+act-plus-plus/ckpts/
+tensorboard_log/
+
+# Dataset and media outputs
+data/
+datasets/
+videos/
+*.mp4
+
+# PyTorch and model files
+*.pt
+*.pth
+*.ckpt
+
+# Optional local env files
+.env
+.env.*
