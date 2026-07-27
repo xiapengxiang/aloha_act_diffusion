@@ -69,6 +69,9 @@ cd act-plus-plus
 
 ### Train ACT
 
+--no_rollout_eval for avoiding rollout eval. Rollout evaluation is only supported for Aloha robot. Disable it with own robot.
+--augment_images to simply randomize image input for better generalization.
+
 ```bash
 python imitate_episodes.py \
   --task_name place_solar_panel \
@@ -82,7 +85,8 @@ python imitate_episodes.py \
   --num_steps 20000 \
   --lr 1e-5 \
   --seed 0 \
-  --no_rollout_eval
+  --no_rollout_eval \
+  --augment_images
 ```
 
 ### Train Diffusion
@@ -118,13 +122,17 @@ It supports:
 
 ### ACT smoke test
 
+--save_heatmaps and --heatmap_dir to save attention heatmap.
+
 ```bash
 cd act-plus-plus
 python policy_inference.py \
   --inference_policy_class ACT \
   --ckpt_dir /fileStore/xpx_data/act_output/place_solar_panel \
   --ckpt_name policy_step_7000_kl_0.005.ckpt \
-  --smoke_test
+  --smoke_test \
+  --save_heatmaps \
+  --heatmap_dir /fileStore/xpx_data/aloha_data/ACT_heatmap
 ```
 
 ### Diffusion smoke test

@@ -48,6 +48,68 @@ def get_auto_index(dataset_dir):
             return i
     raise Exception(f"Error getting auto index, or more than {max_idx} episodes")
 
+
+def normalize_heatmap(heatmap):
+    heatmap = heatmap - np.min(heatmap)
+    max_value = np.max(heatmap)
+    if max_value > 0:
+        heatmap = heatmap / max_value
+    return heatmap
+
+
+def save_heatmap_overlay(image_tensor, saliency_tensor, camera_names, output_path):
+    image_np = image_tensor.detach().cpu().numpy()[0]
+    saliency_np = saliency_tensor.detach().cpu().numpy()[0]
+    num_cameras = len(camera_names)
+
+    fig, axes = plt.subplots(2, num_cameras, figsize=(4 * num_cameras, 8))
+    if num_cameras == 1:
+        axes = np.array(axes).reshape(2, 1)
+
+    for cam_idx, cam_name in enumerate(camera_names):
+        camera_image = np.transpose(image_np[cam_idx], (1, 2, 0))
+        camera_heatmap = normalize_heatmap(saliency_np[cam_idx])
+
+        axes[0, cam_idx].imshow(np.clip(camera_image, 0.0, 1.0))
+        axes[0, cam_idx].set_title(f'{cam_name} image')
+        axes[0, cam_idx].axis('off')
+
+        axes[1, cam_idx].imshow(np.clip(camera_image, 0.0, 1.0))
+        axes[1, cam_idx].imshow(camera_heatmap, cmap='jet', alpha=0.45)
+        axes[1, cam_idx].set_title(f'{cam_name} heatmap')
+        axes[1, cam_idx].axis('off')
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.02)
+    plt.close(fig)
+
+
+def compute_saliency_map(policy, policy_class, qpos, curr_image, t, query_frequency, vq_sample=None):
+    image_for_grad = curr_image.detach().clone().requires_grad_(True)
+    policy.zero_grad(set_to_none=True)
+
+    with torch.enable_grad():
+        if policy_class == 'ACT':
+            if vq_sample is None:
+                output = policy(qpos, image_for_grad)
+            else:
+                output = policy(qpos, image_for_grad, vq_sample=vq_sample)
+            scalar = output[:, t % query_frequency].sum()
+        elif policy_class == 'Diffusion':
+            output = policy(qpos, image_for_grad)
+            scalar = output[:, t % query_frequency].sum()
+        elif policy_class == 'CNNMLP':
+            output = policy(qpos, image_for_grad)
+            scalar = output.sum()
+        else:
+            raise NotImplementedError
+
+        scalar.backward()
+
+    saliency = image_for_grad.grad.detach().abs().mean(dim=2)
+    return saliency
+
 def main(args):
     set_seed(1)
     # command line parameters
@@ -85,6 +147,9 @@ def main(args):
     default_base_action_dim = max(action_dim - state_dim, 0)
     base_action_dim = args['base_action_dim'] if args['base_action_dim'] is not None else task_config.get('base_action_dim', default_base_action_dim)
     setup_base = task_config.get('setup_base', base_action_dim > 0)
+    augment_images = args['augment_images']
+    save_heatmaps = args['save_heatmaps']
+    heatmap_dir = args['heatmap_dir'] if args['heatmap_dir'] is not None else os.path.join(ckpt_dir, 'heatmaps')
     if action_dim < state_dim:
         raise ValueError(f'action_dim ({action_dim}) must be >= state_dim ({state_dim}) when base actions are appended')
     if base_action_dim < 0 or base_action_dim > action_dim:
@@ -168,6 +233,9 @@ def main(args):
         'eval_on_real_robot': args['eval_on_real_robot'],
         'skip_rollout_eval': args['no_rollout_eval'],
         'load_pretrain': args['load_pretrain'],
+        'augment_images': augment_images,
+        'save_heatmaps': save_heatmaps,
+        'heatmap_dir': heatmap_dir,
         'actuator_config': actuator_config,
     }
 
@@ -196,7 +264,7 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, name_filter, camera_names, batch_size_train, batch_size_val, args['chunk_size'], args['skip_mirrored_data'], config['load_pretrain'], policy_class, stats_dir_l=stats_dir, sample_weights=sample_weights, train_ratio=train_ratio)
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, name_filter, camera_names, batch_size_train, batch_size_val, args['chunk_size'], args['skip_mirrored_data'], config['load_pretrain'], policy_class, stats_dir_l=stats_dir, sample_weights=sample_weights, train_ratio=train_ratio, augment_images=augment_images)
 
     # save dataset stats
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -275,6 +343,8 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
     action_dim = config['action_dim']
     base_action_dim = config.get('base_action_dim', 2)
     setup_base = config.get('setup_base', base_action_dim > 0)
+    save_heatmaps = config.get('save_heatmaps', False)
+    heatmap_dir = config.get('heatmap_dir', os.path.join(ckpt_dir, 'heatmaps'))
     vq = config['policy_config']['vq']
     actuator_config = config['actuator_config']
     use_actuator_net = actuator_config['actuator_network_dir'] is not None
@@ -297,6 +367,8 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
         print(f'Loaded policy from: {ckpt_path}, latent model from: {latent_model_ckpt_path}')
     else:
         print(f'Loaded: {ckpt_path}')
+    if save_heatmaps:
+        os.makedirs(heatmap_dir, exist_ok=True)
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'rb') as f:
         stats = pickle.load(f)
@@ -383,12 +455,13 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
         rewards = []
         # if use_actuator_net:
         #     norm_episode_all_base_actions = [actuator_norm(np.zeros(history_len, 2)).tolist()]
-        with torch.inference_mode():
+        with torch.no_grad():
             time0 = time.time()
             DT = 1 / FPS
             culmulated_delay = 0 
             for t in range(max_timesteps):
                 time1 = time.time()
+                vq_sample = None
                 ### update onscreen render and wait for DT
                 if onscreen_render:
                     image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
@@ -467,6 +540,12 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                 else:
                     raise NotImplementedError
                 # print('query policy: ', time.time() - time3)
+
+                if save_heatmaps and (t % query_frequency == 0):
+                    saliency = compute_saliency_map(policy, config['policy_class'], qpos, curr_image, t, query_frequency, vq_sample=vq_sample)
+                    rollout_heatmap_dir = os.path.join(heatmap_dir, f'rollout_{rollout_id:03d}')
+                    heatmap_path = os.path.join(rollout_heatmap_dir, f'step_{t:04d}.png')
+                    save_heatmap_overlay(curr_image, saliency, camera_names, heatmap_path)
 
                 ### post-process actions
                 time4 = time.time()
@@ -701,6 +780,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_every', action='store', type=int, default=500, help='save_every', required=False)
     parser.add_argument('--resume_ckpt_path', action='store', type=str, help='resume_ckpt_path', required=False)
     parser.add_argument('--skip_mirrored_data', action='store_true')
+    parser.add_argument('--augment_images', action='store_true', default=False)
     parser.add_argument('--actuator_network_dir', action='store', type=str, help='actuator_network_dir', required=False)
     parser.add_argument('--history_len', action='store', type=int)
     parser.add_argument('--future_len', action='store', type=int)
@@ -708,6 +788,8 @@ if __name__ == '__main__':
     parser.add_argument('--state_dim', action='store', type=int, required=False)
     parser.add_argument('--action_dim', action='store', type=int, required=False)
     parser.add_argument('--base_action_dim', action='store', type=int, required=False)
+    parser.add_argument('--save_heatmaps', action='store_true', default=False)
+    parser.add_argument('--heatmap_dir', action='store', type=str, required=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)

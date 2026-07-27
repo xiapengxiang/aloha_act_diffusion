@@ -47,7 +47,7 @@ def resize_image_to_shape(image, target_shape):
     return resized
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_path_list, camera_names, norm_stats, episode_ids, episode_len, chunk_size, policy_class):
+    def __init__(self, dataset_path_list, camera_names, norm_stats, episode_ids, episode_len, chunk_size, policy_class, augment_images=False):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_path_list = dataset_path_list
@@ -58,10 +58,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.cumulative_len = np.cumsum(self.episode_len)
         self.max_episode_len = max(episode_len)
         self.policy_class = policy_class
-        if self.policy_class == 'Diffusion':
-            self.augment_images = True
-        else:
-            self.augment_images = False
+        self.augment_images = augment_images or (self.policy_class == 'Diffusion')
         self.transformations = None
         self.__getitem__(0) # initialize self.is_sim and self.transformations
         self.is_sim = False
@@ -238,7 +235,7 @@ def BatchSampler(batch_size, episode_len_l, sample_weights):
             batch.append(step_idx)
         yield batch
 
-def load_data(dataset_dir_l, name_filter, camera_names, batch_size_train, batch_size_val, chunk_size, skip_mirrored_data=False, load_pretrain=False, policy_class=None, stats_dir_l=None, sample_weights=None, train_ratio=0.99):
+def load_data(dataset_dir_l, name_filter, camera_names, batch_size_train, batch_size_val, chunk_size, skip_mirrored_data=False, load_pretrain=False, policy_class=None, stats_dir_l=None, sample_weights=None, train_ratio=0.99, augment_images=False):
     if type(dataset_dir_l) == str:
         dataset_dir_l = [dataset_dir_l]
     dataset_path_list_list = [find_all_hdf5(dataset_dir, skip_mirrored_data) for dataset_dir in dataset_dir_l]
@@ -281,11 +278,11 @@ def load_data(dataset_dir_l, name_filter, camera_names, batch_size_train, batch_
     # print(f'train_episode_len: {train_episode_len}, val_episode_len: {val_episode_len}, train_episode_ids: {train_episode_ids}, val_episode_ids: {val_episode_ids}')
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(dataset_path_list, camera_names, norm_stats, train_episode_ids, train_episode_len, chunk_size, policy_class)
-    val_dataset = EpisodicDataset(dataset_path_list, camera_names, norm_stats, val_episode_ids, val_episode_len, chunk_size, policy_class)
+    train_dataset = EpisodicDataset(dataset_path_list, camera_names, norm_stats, train_episode_ids, train_episode_len, chunk_size, policy_class, augment_images=augment_images)
+    val_dataset = EpisodicDataset(dataset_path_list, camera_names, norm_stats, val_episode_ids, val_episode_len, chunk_size, policy_class, augment_images=False)
     train_num_workers = (8 if os.getlogin() == 'zfu' else 16) if train_dataset.augment_images else 2
     val_num_workers = 8 if train_dataset.augment_images else 2
-    print(f'Augment images: {train_dataset.augment_images}, train_num_workers: {train_num_workers}, val_num_workers: {val_num_workers}')
+    print(f'Augment images: train={train_dataset.augment_images}, val={val_dataset.augment_images}, train_num_workers: {train_num_workers}, val_num_workers: {val_num_workers}')
     train_dataloader = DataLoader(train_dataset, batch_sampler=batch_sampler_train, pin_memory=True, num_workers=train_num_workers, prefetch_factor=2)
     val_dataloader = DataLoader(val_dataset, batch_sampler=batch_sampler_val, pin_memory=True, num_workers=val_num_workers, prefetch_factor=2)
 

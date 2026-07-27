@@ -143,7 +143,7 @@ class DETRVAE(nn.Module):
 
         return latent_input, probs, binaries, mu, logvar
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None):
+    def _forward_impl(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None, return_attn=False):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -157,10 +157,12 @@ class DETRVAE(nn.Module):
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
+            camera_shapes = []
             for cam_id, cam_name in enumerate(self.camera_names):
                 features, pos = self.backbones[cam_id](image[:, cam_id])
                 features = features[0] # take the last layer feature
                 pos = pos[0]
+                camera_shapes.append(tuple(features.shape[-2:]))
                 all_cam_features.append(self.input_proj(features))
                 all_cam_pos.append(pos)
             # proprioception features
@@ -168,15 +170,37 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            transformer_output = self.transformer(
+                src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight,
+                return_attn=return_attn,
+            )
+            if return_attn:
+                hs, attn_weights = transformer_output
+            else:
+                hs = transformer_output
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
-            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
+            transformer_output = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight,
+                                                  return_attn=return_attn)
+            if return_attn:
+                hs, attn_weights = transformer_output
+            else:
+                hs = transformer_output
+            camera_shapes = []
+        hs = hs[0]
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
+        if return_attn:
+            return a_hat, is_pad_hat, [mu, logvar], probs, binaries, attn_weights, camera_shapes
         return a_hat, is_pad_hat, [mu, logvar], probs, binaries
+
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None):
+        return self._forward_impl(qpos, image, env_state, actions=actions, is_pad=is_pad, vq_sample=vq_sample, return_attn=False)
+
+    def forward_with_attention(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None):
+        return self._forward_impl(qpos, image, env_state, actions=actions, is_pad=is_pad, vq_sample=vq_sample, return_attn=True)
 
 
 

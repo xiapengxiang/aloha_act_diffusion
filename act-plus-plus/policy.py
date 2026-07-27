@@ -274,6 +274,14 @@ class ACTPolicy(nn.Module):
             a_hat, _, (_, _), _, _ = self.model(qpos, image, env_state, vq_sample=vq_sample) # no action, sample from prior
             return a_hat
 
+    @torch.no_grad()
+    def forward_with_attention(self, qpos, image, vq_sample=None):
+        env_state = None
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        image = normalize(image)
+        return self.model.forward_with_attention(qpos, image, env_state, vq_sample=vq_sample)
+
     def configure_optimizers(self):
         return self.optimizer
 

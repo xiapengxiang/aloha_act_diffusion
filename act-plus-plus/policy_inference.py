@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+import matplotlib.pyplot as plt
 import torchvision.transforms as transforms
 
 from constants import SIM_TASK_CONFIGS, TASK_CONFIGS
@@ -79,6 +80,71 @@ def find_latest_step_checkpoint(ckpt_dir):
         return None
     candidates.sort(key=lambda item: item[0])
     return candidates[-1][1]
+
+
+def normalize_heatmap(heatmap):
+    heatmap = heatmap - np.min(heatmap)
+    max_value = np.max(heatmap)
+    if max_value > 0:
+        heatmap = heatmap / max_value
+    return heatmap
+
+
+def split_attention_by_camera(attention_vector, camera_shapes):
+    if not camera_shapes:
+        return []
+
+    heights = [shape[0] for shape in camera_shapes]
+    widths = [shape[1] for shape in camera_shapes]
+    if len(set(heights)) != 1:
+        raise ValueError(f'Expected the same attention height for all cameras, got {camera_shapes}')
+
+    height = heights[0]
+    width_total = sum(widths)
+    combined = attention_vector.reshape(height, width_total)
+
+    camera_heatmaps = []
+    offset = 0
+    for width in widths:
+        camera_heatmaps.append(combined[:, offset:offset + width])
+        offset += width
+    return camera_heatmaps
+
+
+def save_attention_overlay(image_dict, attention_weights, camera_shapes, camera_names, output_path):
+    attention_vector = attention_weights.detach().float().mean(dim=1).mean(dim=1)[0]
+    attention_vector = attention_vector[2:]
+    camera_heatmaps = split_attention_by_camera(attention_vector.cpu().numpy(), camera_shapes)
+    if not camera_heatmaps:
+        return
+
+    fig, axes = plt.subplots(2, len(camera_names), figsize=(4 * len(camera_names), 8))
+    if len(camera_names) == 1:
+        axes = np.array(axes).reshape(2, 1)
+
+    for cam_idx, cam_name in enumerate(camera_names):
+        image = np.asarray(image_dict[cam_name])
+        if image.dtype != np.float32 and image.dtype != np.float64:
+            image = image.astype(np.float32) / 255.0
+
+        heatmap = normalize_heatmap(camera_heatmaps[cam_idx])
+        heatmap_tensor = torch.from_numpy(heatmap).float().unsqueeze(0).unsqueeze(0)
+        heatmap_tensor = F.interpolate(heatmap_tensor, size=image.shape[:2], mode='bilinear', align_corners=False)
+        heatmap = heatmap_tensor[0, 0].cpu().numpy()
+
+        axes[0, cam_idx].imshow(np.clip(image, 0.0, 1.0))
+        axes[0, cam_idx].set_title(f'{cam_name} image')
+        axes[0, cam_idx].axis('off')
+
+        axes[1, cam_idx].imshow(np.clip(image, 0.0, 1.0))
+        axes[1, cam_idx].imshow(heatmap, cmap='jet', alpha=0.45)
+        axes[1, cam_idx].set_title(f'{cam_name} attention')
+        axes[1, cam_idx].axis('off')
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.02)
+    plt.close(fig)
 
 
 class ActInference:
@@ -273,10 +339,47 @@ class ActInference:
         return action_np
 
     @torch.inference_mode()
-    def smoke_test_from_training_data(self, dataset_dir=None, batch_size=1, chunk_size=None, episode_hdf5=None):
+    def predict_with_attention(self, qpos, images, already_normalized=False, vq_sample=None):
+        if not isinstance(self.model, ACTPolicy):
+            raise NotImplementedError('Attention heatmaps are only supported for ACT in this helper script.')
+
+        t0 = time.perf_counter()
+        qpos_tensor = self.preprocess_qpos(qpos, already_normalized=already_normalized)
+        image_tensor = self.preprocess_images(images)
+
+        if self.use_vq:
+            if vq_sample is None:
+                vq_sample = self.latent_model.generate(1, temperature=1, x=None)
+            action, _, _, _, _, attn_weights, camera_shapes = self.model.forward_with_attention(
+                qpos_tensor,
+                image_tensor,
+                vq_sample=vq_sample,
+            )
+        else:
+            action, _, _, _, _, attn_weights, camera_shapes = self.model.forward_with_attention(
+                qpos_tensor,
+                image_tensor,
+            )
+
+        action = self._denormalize_action(action)
+        action_np = action.squeeze(0).detach().cpu().numpy()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        print(f'predict-with-attention latency: {elapsed_ms:.2f} ms')
+        return action_np, attn_weights.detach().cpu(), camera_shapes
+
+    @torch.inference_mode()
+    def smoke_test_from_training_data(self, dataset_dir=None, batch_size=1, chunk_size=None, episode_hdf5=None, save_heatmaps=False, heatmap_dir=None):
         task_name = self.config['task_name']
         if chunk_size is None:
             chunk_size = self.policy_config['num_queries']
+
+        if save_heatmaps and not isinstance(self.model, ACTPolicy):
+            raise NotImplementedError('Smoke-test heatmaps are only supported for ACT attention in this script.')
+
+        if save_heatmaps:
+            if heatmap_dir is None:
+                heatmap_dir = str(self.ckpt_dir / 'heatmaps')
+            os.makedirs(heatmap_dir, exist_ok=True)
 
         if episode_hdf5 is None:
             if dataset_dir is None:
@@ -302,6 +405,7 @@ class ActInference:
         all_target = []
         step_l1 = []
         step_l2 = []
+        episode_stem = Path(episode_hdf5).stem if episode_hdf5 is not None else 'episode'
 
         for ts in range(total_steps):
             qpos = qpos_seq[ts]
@@ -309,7 +413,12 @@ class ActInference:
             target = self._build_chunk_target(action_seq, ts, chunk_size, metadata['sim'])
 
             # Compare deployed robot-space actions from predict() against dataset action targets.
-            pred_np = self.predict(qpos, images)
+            if save_heatmaps:
+                pred_np, attn_weights, camera_shapes = self.predict_with_attention(qpos, images)
+                heatmap_path = os.path.join(heatmap_dir, episode_stem, f'step_{ts:04d}.png')
+                save_attention_overlay(images, attn_weights, camera_shapes, self.camera_names, heatmap_path)
+            else:
+                pred_np = self.predict(qpos, images)
             pred = torch.from_numpy(pred_np).float().unsqueeze(0).cuda()
             pred = pred[:, :target.shape[1]]
 
@@ -410,6 +519,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for smoke test')
     parser.add_argument('--chunk_size', type=int, default=None, help='Override chunk size for smoke test')
     parser.add_argument('--smoke_test', action='store_true', help='Run a training-data smoke test after loading the policy')
+    parser.add_argument('--save_heatmaps', action='store_true', help='Save transformer attention overlays during the smoke test')
+    parser.add_argument('--heatmap_dir', type=str, default=None, help='Directory to store smoke-test attention overlays')
     parser.add_argument('--qpos', type=str, default=None, help='Comma-separated raw qpos for one-step inference')
     parser.add_argument('--image_hdf5', type=str, default=None, help='Path to one HDF5 episode for single-step inference')
     parser.add_argument('--timestep', type=int, default=0, help='Timestep to read from --image_hdf5')
@@ -426,6 +537,8 @@ def main():
             batch_size=args.batch_size,
             chunk_size=args.chunk_size,
             episode_hdf5=args.episode_hdf5,
+            save_heatmaps=args.save_heatmaps,
+            heatmap_dir=args.heatmap_dir,
         )
         return
 
