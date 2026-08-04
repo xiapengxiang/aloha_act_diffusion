@@ -78,10 +78,10 @@ python imitate_episodes.py \
   --ckpt_dir /fileStore/xpx_data/act_output/place_solar_panel \
   --policy_class ACT \
   --kl_weight 10 \
-  --chunk_size 20 \
+  --chunk_size 50 \
   --hidden_dim 512 \
   --batch_size 8 \
-  --dim_feedforward 320 \
+  --dim_feedforward 3200 \
   --num_steps 20000 \
   --lr 1e-5 \
   --seed 0 \
